@@ -82,10 +82,10 @@ QWERTY-style layout. To remap:
 
 ## `clave-piano.html` extras
 
-- Uses the **Salamander Grand Piano** samples (same source as
-  [my-midi-toy](https://tonejs.github.io/audio/salamander/)). 30 samples every
-  3 semitones; intermediate notes are detuned via `playbackRate`. Samples are
-  cached by the browser after first load.
+- Uses the **Salamander Grand Piano** samples served from
+  [`https://tonejs.github.io/audio/salamander/`](https://tonejs.github.io/audio/salamander/).
+  30 samples every 3 semitones; intermediate notes are detuned via
+  `playbackRate`. Samples are cached by the browser after first load.
 - **Sustain pedal**: click **Set sustain key**, then press the physical key
   you want as the pedal (the F68's spacebar works well). Holding it defers
   releases; lifting it dampens all held notes.
