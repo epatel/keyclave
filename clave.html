@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Clave</title>
+<style>
+  body { font: 14px/1.4 ui-monospace, Menlo, monospace; margin: 1.5rem; max-width: 920px; }
+  h1 { font-size: 1.4em; margin: 0 0 .8em; }
+  h2 { font-size: 1em; margin: 0 0 .4em; color: #666; }
+  section { padding: .8em 0; border-top: 1px solid #eee; }
+  section:first-of-type { border-top: 0; }
+  button { font: inherit; padding: .35em .8em; margin: 0 .3em .3em 0; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  input[type=number] { width: 4.5em; font: inherit; padding: .15em .3em; }
+  select { font: inherit; padding: .15em .3em; }
+  label { display: inline-block; margin-right: 1em; }
+  .row { display: flex; flex-wrap: wrap; gap: .4em 1em; align-items: center; }
+  .pill { display: inline-block; padding: .15em .55em; border-radius: 1em; background: #eee; font-size: .9em; }
+  .pill.live { background: #cfc; }
+  #log { height: 180px; overflow: auto; background: #111; color: #0f0; padding: .5em; white-space: pre; font-size: .85em; }
+  #mapping { font-size: .85em; max-height: 280px; overflow: auto; }
+  #mapping table { border-collapse: collapse; }
+  #mapping th, #mapping td { border: 1px solid #ddd; padding: .15em .55em; text-align: right; }
+  #mapping td:last-child { text-align: left; }
+  #active { font-size: 1.3em; min-height: 1.4em; color: #0a0; }
+</style>
+</head>
+<body>
+
+<h1>Clave — F68 Pro analog keyboard → MIDI / sampler</h1>
+
+<section>
+  <h2>Connection</h2>
+  <div class="row">
+    <button id="connect">Connect</button>
+    <button id="stop" disabled>Stop</button>
+    <span class="pill" id="status">disconnected</span>
+    <span class="pill" id="polls">0 polls</span>
+  </div>
+</section>
+
+<section>
+  <h2>Tuning</h2>
+  <div class="row">
+    <label>Arm <input id="arm"  type="number" min="1" max="400" value="60" /></label>
+    <label>Fire <input id="fire" type="number" min="1" max="400" value="280" /></label>
+    <label>Release <input id="rel" type="number" min="1" max="400" value="30" /></label>
+    <label>Vmax <input id="vmax" type="number" min="1" max="40" step="0.5" value="12" /></label>
+  </div>
+</section>
+
+<section>
+  <h2>Output</h2>
+  <div class="row">
+    <label>Mode
+      <select id="outMode">
+        <option value="midi" selected>MIDI</option>
+        <option value="sampler">Piano sampler (scaffold)</option>
+        <option value="off">Off</option>
+      </select>
+    </label>
+    <label>MIDI channel <input id="ch" type="number" min="1" max="16" value="1" /></label>
+    <button id="outApply">Apply</button>
+    <span class="pill" id="outStatus">off</span>
+  </div>
+  <div id="active"></div>
+</section>
+
+<section>
+  <h2>Calibration</h2>
+  <div class="row">
+    <button id="cal">Start</button>
+    <button id="calSkip">Skip</button>
+    <button id="calUndo">Undo</button>
+    <button id="calDone">Done</button>
+    <button id="calClear">Clear all</button>
+    <button id="mapSave">Save JSON</button>
+    <button id="mapLoad">Load JSON</button>
+    <button id="mapReset">Reset to default</button>
+    <input id="mapLoadInput" type="file" accept="application/json" style="display:none" />
+    <label>Base note <input id="base" type="number" min="0" max="127" value="48" /></label>
+    <label><input id="calChrom" type="checkbox" checked /> chromatic</label>
+  </div>
+  <p>Status: <strong id="calStatus">idle</strong></p>
+  <div id="mapping"></div>
+</section>
+
+<section>
+  <h2>Log</h2>
+  <div id="log"></div>
+</section>
+
+<script>
+// ============================================================================
+// 1. Default key-id → MIDI mapping (24 keys, C3–B4).  Overridden by
+//    localStorage and by Load JSON.
+// ============================================================================
+const DEFAULT_MAPPING = {
+  "2": 48, "7": 49, "8": 50, "13": 51, "14": 52, "20": 53,
+  "25": 54, "26": 55, "31": 56, "32": 57, "37": 58, "38": 59,
+  "44": 60, "49": 61, "50": 62, "55": 63, "56": 64, "62": 65,
+  "67": 66, "68": 67, "73": 68, "74": 69, "79": 70, "80": 71,
+};
+
+// ============================================================================
+// 2. Utilities
+// ============================================================================
+const $ = id => document.getElementById(id);
+const log = (...a) => {
+  const el = $('log');
+  el.textContent += a.join(' ') + '\n';
+  el.scrollTop = 1e9;
+};
+const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join(' ');
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const midiName = n => NOTE_NAMES[((n%12)+12)%12] + (Math.floor(n/12) - 1);
+const isWhite  = n => [0,2,4,5,7,9,11].includes(((n%12)+12)%12);
+const clamp = (lo, hi, v) => Math.max(lo, Math.min(hi, v));
+
+// ============================================================================
+// 3. Mapping module — physical key id → MIDI note
+// ============================================================================
+const Mapping = {
+  table: {},
+  has(key)         { return key in this.table; },
+  get(key)         { return this.table[key]; },
+  set(key, midi)   { this.table[key] = midi; this.save(); },
+  remove(key)      { delete this.table[key];  this.save(); },
+  clearAll()       { this.table = {};                    this.save(); },
+  resetToDefault() { this.table = { ...DEFAULT_MAPPING }; this.save(); },
+  save() {
+    try { localStorage.setItem('clave-map', JSON.stringify(this.table)); } catch {}
+    renderMapping();
+  },
+  load() {
+    try {
+      const j = localStorage.getItem('clave-map');
+      this.table = j ? JSON.parse(j) : { ...DEFAULT_MAPPING };
+    } catch {
+      this.table = { ...DEFAULT_MAPPING };
+    }
+  },
+};
+Mapping.load();
+
+// ============================================================================
+// 4. Output abstraction — pluggable backends.  Add new ones by subclassing
+//    Output and registering them in `outputFor()` below.
+// ============================================================================
+class Output {
+  constructor(name) { this.ready = false; this.name = name; }
+  async start() {}
+  async stop()  {}
+  noteOn(midi, velocity)  {}
+  noteOff(midi)           {}
+}
+
+class MidiOutput extends Output {
+  constructor() { super('MIDI'); this.port = null; }
+  async start() {
+    const access = await navigator.requestMIDIAccess({ sysex: false });
+    const outs = [...access.outputs.values()];
+    if (!outs.length) throw new Error('no MIDI output (start IAC bus or DAW)');
+    this.port = outs[0];
+    this.ready = true;
+    log('MIDI out:', this.port.name);
+  }
+  async stop() { this.port = null; this.ready = false; }
+  noteOn(midi, vel) {
+    if (!this.ready) return;
+    const ch = (+$('ch').value - 1) & 15;
+    this.port.send([0x90 | ch, midi & 127, vel & 127]);
+  }
+  noteOff(midi) {
+    if (!this.ready) return;
+    const ch = (+$('ch').value - 1) & 15;
+    this.port.send([0x80 | ch, midi & 127, 0]);
+  }
+}
+
+// Self-contained sampler.  Today: a basic Web Audio synth so the audio path
+// is verified end-to-end.  To make it sound like a piano, call
+// `output.loadSamples({60: 'C4.mp3', 64: 'E4.mp3', ...})` after starting.
+//
+// Suggested CC-licensed piano sample sets to plug in:
+//   • Salamander Grand Piano V3            (CC-BY)
+//   • VSCO 2 Community Edition Piano       (CC0)
+//   • https://nbrosowsky.github.io/tonejs-instruments/samples/piano/
+//     (Salamander mirror, mp3/ogg per note)
+//
+// Format: { midiNote: 'url', ... }.  noteOn finds the nearest sample and
+// detunes it via playbackRate.
+class SamplerOutput extends Output {
+  constructor() {
+    super('sampler');
+    this.ctx = null;
+    this.master = null;
+    this.samples = {};        // midi → AudioBuffer
+    this.voices  = new Map(); // midi → { source, gain }
+  }
+  async start() {
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    this.master = this.ctx.createGain();
+    this.master.gain.value = 0.4;
+    this.master.connect(this.ctx.destination);
+    this.ready = true;
+    log('sampler ready (synth placeholder — load samples for piano sound)');
+  }
+  async stop() {
+    if (this.ctx) await this.ctx.close();
+    this.ctx = null;
+    this.voices.clear();
+    this.ready = false;
+  }
+  async loadSamples(urlMap) {
+    if (!this.ctx) throw new Error('start sampler first');
+    const entries = await Promise.all(Object.entries(urlMap).map(async ([midi, url]) => {
+      const buf = await this.ctx.decodeAudioData(await (await fetch(url)).arrayBuffer());
+      return [+midi, buf];
+    }));
+    this.samples = Object.fromEntries(entries);
+    log('sampler loaded', entries.length, 'samples');
+  }
+  noteOn(midi, vel) {
+    if (!this.ready) return;
+    this.noteOff(midi);
+    const now = this.ctx.currentTime;
+    const gain = this.ctx.createGain();
+    gain.connect(this.master);
+
+    const samplePitches = Object.keys(this.samples).map(Number);
+    if (samplePitches.length) {
+      const nearest = samplePitches.reduce((a, b) =>
+        Math.abs(b - midi) < Math.abs(a - midi) ? b : a);
+      const src = this.ctx.createBufferSource();
+      src.buffer = this.samples[nearest];
+      src.playbackRate.value = Math.pow(2, (midi - nearest) / 12);
+      gain.gain.value = (vel / 127) * 0.9;
+      src.connect(gain);
+      src.start(now);
+      this.voices.set(midi, { source: src, gain });
+    } else {
+      // Placeholder synth — two-osc piano-ish, no real piano character.
+      const freq = 440 * Math.pow(2, (midi - 69) / 12);
+      const o1 = this.ctx.createOscillator(); o1.type = 'triangle'; o1.frequency.value = freq;
+      const o2 = this.ctx.createOscillator(); o2.type = 'sine';     o2.frequency.value = freq * 2;
+      o2.detune.value = 4;
+      gain.gain.value = 0;
+      const peak = (vel / 127) * 0.3;
+      gain.gain.linearRampToValueAtTime(peak, now + 0.005);
+      gain.gain.exponentialRampToValueAtTime(peak * 0.4, now + 0.25);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 2.5);
+      o1.connect(gain);
+      o2.connect(gain);
+      o1.start(now); o2.start(now);
+      o1.stop(now + 3); o2.stop(now + 3);
+      this.voices.set(midi, { source: o1, gain });
+    }
+  }
+  noteOff(midi) {
+    const v = this.voices.get(midi);
+    if (!v) return;
+    this.voices.delete(midi);
+    const now = this.ctx.currentTime;
+    v.gain.gain.cancelScheduledValues(now);
+    v.gain.gain.setValueAtTime(Math.max(v.gain.gain.value, 0.0001), now);
+    v.gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+    if (v.source.stop) { try { v.source.stop(now + 0.35); } catch {} }
+  }
+}
+
+function outputFor(mode) {
+  if (mode === 'midi')    return new MidiOutput();
+  if (mode === 'sampler') return new SamplerOutput();
+  return null;
+}
+
+let output = null;
+
+// ============================================================================
+// 5. HID protocol — FREE WOLF F68 Pro
+//    Two interfaces: commands → devOut (vendor ffff/2, feature reports);
+//    mode acks ← devIn (vendor ffff/1, input report id=5).
+// ============================================================================
+const F68 = {
+  VID: 0x3151,
+  PID: 0x5029,
+  devIn: null, devOut: null,
+  featId: 0, featLen: 64,
+  polling: false, pollCount: 0,
+
+  pkt(...b) {
+    const a = new Uint8Array(this.featLen);
+    for (let i = 0; i < Math.min(b.length, 7); i++) a[i] = b[i];
+    let s = 0;
+    for (let i = 0; i < 7; i++) s += a[i];
+    a[7] = (0xff - s) & 0xff;
+    return a;
+  },
+  async sendFeat(bytes) { await this.devOut.sendFeatureReport(this.featId, bytes); },
+  async recvFeat() {
+    return new Uint8Array((await this.devOut.receiveFeatureReport(this.featId)).buffer);
+  },
+  waitInput(pred, timeoutMs = 1500) {
+    return new Promise(resolve => {
+      let done = false;
+      const handler = ev => {
+        const b = new Uint8Array(ev.data.buffer);
+        if (pred(b, ev.reportId)) {
+          done = true;
+          this.devIn.removeEventListener('inputreport', handler);
+          resolve(b);
+        }
+      };
+      this.devIn.addEventListener('inputreport', handler);
+      setTimeout(() => {
+        if (!done) {
+          this.devIn.removeEventListener('inputreport', handler);
+          resolve(null);
+        }
+      }, timeoutMs);
+    });
+  },
+
+  async connect() {
+    let ds = await navigator.hid.requestDevice({
+      filters: [
+        { vendorId: this.VID, productId: this.PID, usagePage: 0xffff, usage: 1 },
+        { vendorId: this.VID, productId: this.PID, usagePage: 0xffff, usage: 2 },
+      ],
+    });
+    if (!ds.length) ds = await navigator.hid.requestDevice({
+      filters: [{ vendorId: this.VID, productId: this.PID }],
+    });
+    if (!ds.length) return false;
+
+    for (const d of ds) {
+      if (!d.opened) await d.open();
+      log('opened', d.productName);
+    }
+
+    const reportSize = r => Math.ceil(((r.items || [])
+      .reduce((s, it) => s + (it.reportSize || 0) * (it.reportCount || 0), 0)) / 8);
+
+    this.devOut = ds.find(d => d.collections.some(c =>
+      c.usagePage === 0xffff && (c.featureReports || []).length)) || ds[0];
+    this.devIn = ds.find(d => d.collections.some(c =>
+      c.usagePage === 0xffff && (c.inputReports || []).some(r => r.reportId === 5))) || ds[0];
+
+    const vendorColl = this.devOut.collections.find(c =>
+      c.usagePage === 0xffff && (c.featureReports || []).length);
+    const fr = vendorColl && vendorColl.featureReports[0];
+    if (fr) {
+      this.featId = fr.reportId | 0;
+      this.featLen = reportSize(fr) || 64;
+    }
+    log(`feature report id=${this.featId} len=${this.featLen}`);
+
+    this.devIn.addEventListener('inputreport', e => {
+      if (e.reportId !== 5) return;
+      const b = new Uint8Array(e.data.buffer);
+      log('← state', hex(b.slice(0, 2)));
+    });
+
+    await this.enable();
+    return true;
+  },
+
+  async enable() {
+    $('status').textContent = 'enabling';
+    log('→ 1c 01');
+    await this.sendFeat(this.pkt(0x1c, 0x01));
+    await new Promise(r => setTimeout(r, 150));
+    log('→ 1c 00');
+    const p1 = this.waitInput(b => b[0] === 0x0f && b[1] === 0x01);
+    await this.sendFeat(this.pkt(0x1c, 0x00));
+    await p1;
+    await this.waitInput(b => b[0] === 0x0f && b[1] === 0x00, 500);
+    log('→ 1e 01 (streaming)');
+    await this.sendFeat(this.pkt(0x1e, 0x01));
+    await new Promise(r => setTimeout(r, 50));
+    $('status').textContent = 'streaming';
+  },
+  async disable() {
+    try { await this.sendFeat(this.pkt(0x1e, 0x00)); } catch {}
+  },
+
+  async startPolling(onFrame) {
+    this.polling = true;
+    this.pollCount = 0;
+    let bank = 0;
+    while (this.polling && this.devOut && this.devOut.opened) {
+      try {
+        await this.sendFeat(this.pkt(0xe5, 0xfe, 0x01, bank));
+        const resp = await this.recvFeat();
+        onFrame(bank, resp);
+        if (++this.pollCount % 32 === 0) $('polls').textContent = this.pollCount + ' polls';
+      } catch (err) {
+        log('poll error:', err.message);
+        break;
+      }
+      bank = (bank + 1) & 3;
+      await new Promise(r => setTimeout(r, 2));
+    }
+    this.polling = false;
+  },
+
+  async shutdown() {
+    this.polling = false;
+    if (this.devOut) await this.disable();
+    for (const d of [this.devIn, this.devOut]) {
+      if (!d) continue;
+      try { await d.close(); } catch {}
+    }
+    this.devIn = this.devOut = null;
+  },
+};
+
+// ============================================================================
+// 6. Detector — analyzes poll frames, emits press/release events.
+//    Subscribe via Detector.onPress / Detector.onRelease.
+// ============================================================================
+const NKEYS = 128;
+const Detector = {
+  prevDepth: new Int16Array(NKEYS),
+  lastT:     new Float64Array(NKEYS),
+  peakVel:   new Float32Array(NKEYS),
+  armed:     new Uint8Array(NKEYS),
+  on:        new Uint8Array(NKEYS),
+
+  onPress: null,   // (key, midiVelocity, peakV, depth) => void
+  onRelease: null, // (key) => void
+
+  velocityFromPeak(peak) {
+    const VMIN = 0.4, VMAX = +$('vmax').value || 12;
+    const v = (peak - VMIN) / (VMAX - VMIN) * 107 + 20;
+    return clamp(1, 127, Math.round(v));
+  },
+
+  processFrame(bank, data) {
+    const now = performance.now();
+    const arm = +$('arm').value, fire = +$('fire').value, rel = +$('rel').value;
+    const vmax = +$('vmax').value;
+    for (let slot = 0; slot < 32; slot++) {
+      const off = slot * 2;
+      if (off + 1 >= data.length) break;
+      const d = data[off] | (data[off + 1] << 8);
+      const key = bank * 32 + slot;
+      const p = this.prevDepth[key];
+      const lt = this.lastT[key];
+
+      let dv = 0;
+      if (lt) dv = (d - p) / Math.max(0.5, now - lt);
+      this.lastT[key] = now;
+      this.prevDepth[key] = d;
+      if (dv > this.peakVel[key]) this.peakVel[key] = dv;
+
+      if (!this.on[key]) {
+        if (!this.armed[key] && d >= arm && d > p) this.armed[key] = 1;
+        if (this.armed[key] && (d >= fire || this.peakVel[key] >= vmax)) {
+          this.on[key] = 1;
+          this.armed[key] = 0;
+          const v = this.velocityFromPeak(this.peakVel[key]);
+          this.onPress && this.onPress(key, v, this.peakVel[key], d);
+        }
+      } else if (d <= rel) {
+        this.on[key] = 0;
+        this.armed[key] = 0;
+        this.peakVel[key] = 0;
+        this.onRelease && this.onRelease(key);
+      }
+    }
+  },
+
+  releaseAll() {
+    for (let k = 0; k < NKEYS; k++) {
+      if (this.on[k] && this.onRelease) this.onRelease(k);
+      this.on[k] = 0;
+      this.armed[k] = 0;
+      this.peakVel[k] = 0;
+    }
+  },
+};
+
+// ============================================================================
+// 7. Calibration — assigns the next-pressed key to the current target note
+// ============================================================================
+const Calibration = {
+  active: false,
+  target: 48,
+
+  start() {
+    this.active = true;
+    this.target = +$('base').value || 48;
+    if (!$('calChrom').checked && !isWhite(this.target)) this.advance(1);
+    this.refresh();
+  },
+  stop()  { this.active = false; this.refresh(); },
+  skip()  { if (this.active) { this.advance(1); this.refresh(); } },
+  undo() {
+    if (!this.active) return;
+    this.advance(-1);
+    for (const k of Object.keys(Mapping.table)) {
+      if (Mapping.table[k] === this.target) Mapping.remove(k);
+    }
+    this.refresh();
+  },
+  advance(step) {
+    this.target += step;
+    if (!$('calChrom').checked) while (!isWhite(this.target)) this.target += step;
+  },
+  record(key) {
+    for (const k of Object.keys(Mapping.table)) {
+      if (Mapping.table[k] === this.target) Mapping.remove(k);
+    }
+    Mapping.set(key, this.target);
+    log(`calibrated key ${key} → ${midiName(this.target)} (${this.target})`);
+    this.advance(1);
+    this.refresh();
+  },
+  refresh() {
+    $('calStatus').textContent = this.active
+      ? `press key for ${midiName(this.target)} (${this.target})`
+      : `${Object.keys(Mapping.table).length} keys mapped`;
+  },
+};
+
+// ============================================================================
+// 8. UI wiring
+// ============================================================================
+function renderMapping() {
+  const rows = ['<table><tr><th>key</th><th>bank/slot</th><th>MIDI</th><th>note</th></tr>'];
+  const keys = Object.keys(Mapping.table).map(Number)
+    .sort((a, b) => Mapping.table[a] - Mapping.table[b]);
+  for (const k of keys) {
+    const m = Mapping.table[k];
+    rows.push(`<tr><td>${k}</td><td>${k>>5}/${k&31}</td><td>${m}</td><td>${midiName(m)}</td></tr>`);
+  }
+  rows.push('</table>');
+  $('mapping').innerHTML = rows.join('');
+}
+
+const activeNotes = new Set();
+function updateActive() {
+  $('active').textContent = [...activeNotes].sort((a, b) => a - b).map(midiName).join(' ');
+}
+
+Detector.onPress = (key, vel, peakV, depth) => {
+  if (Calibration.active) { Calibration.record(key); return; }
+  if (!Mapping.has(key)) return;
+  const midi = Mapping.get(key);
+  output && output.noteOn(midi, vel);
+  activeNotes.add(midi);
+  updateActive();
+  log(`on  key=${key} d=${depth} peakV=${peakV.toFixed(2)} → ${midiName(midi)} v=${vel}`);
+};
+Detector.onRelease = (key) => {
+  if (Calibration.active) return;
+  if (!Mapping.has(key)) return;
+  const midi = Mapping.get(key);
+  output && output.noteOff(midi);
+  activeNotes.delete(midi);
+  updateActive();
+};
+
+$('connect').onclick = async () => {
+  $('connect').disabled = true;
+  try {
+    const ok = await F68.connect();
+    if (!ok) { $('connect').disabled = false; return; }
+    $('stop').disabled = false;
+    F68.startPolling((bank, data) => Detector.processFrame(bank, data));
+  } catch (err) {
+    log('connect failed:', err.message);
+    $('status').textContent = 'error';
+    $('connect').disabled = false;
+  }
+};
+$('stop').onclick = async () => {
+  Detector.releaseAll();
+  await F68.shutdown();
+  activeNotes.clear();
+  updateActive();
+  $('status').textContent = 'disconnected';
+  $('connect').disabled = false;
+  $('stop').disabled = true;
+};
+window.addEventListener('beforeunload', () => F68.shutdown());
+
+$('outApply').onclick = async () => {
+  if (output) { await output.stop(); output = null; }
+  const next = outputFor($('outMode').value);
+  if (!next) { $('outStatus').textContent = 'off'; return; }
+  try {
+    await next.start();
+    output = next;
+    $('outStatus').textContent = next.name + ' on';
+  } catch (err) {
+    log('output start failed:', err.message);
+    $('outStatus').textContent = 'error';
+  }
+};
+
+$('cal').onclick      = () => Calibration.start();
+$('calSkip').onclick  = () => Calibration.skip();
+$('calUndo').onclick  = () => Calibration.undo();
+$('calDone').onclick  = () => Calibration.stop();
+$('calClear').onclick = () => {
+  if (!confirm('Clear all mappings?')) return;
+  Mapping.clearAll();
+  Calibration.refresh();
+};
+$('mapReset').onclick = () => {
+  if (!confirm('Reset to bundled default mapping?')) return;
+  Mapping.resetToDefault();
+  Calibration.refresh();
+};
+$('mapSave').onclick = () => {
+  const blob = new Blob([JSON.stringify(Mapping.table, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'clave-mapping.json';
+  a.click();
+};
+$('mapLoad').onclick = () => $('mapLoadInput').click();
+$('mapLoadInput').onchange = async ev => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  try {
+    Mapping.table = JSON.parse(await f.text());
+    Mapping.save();
+    Calibration.refresh();
+    log('loaded mapping:', Object.keys(Mapping.table).length, 'keys');
+  } catch (err) {
+    log('load failed:', err.message);
+  }
+  ev.target.value = '';
+};
+
+renderMapping();
+Calibration.refresh();
+</script>
+</body>
+</html>
