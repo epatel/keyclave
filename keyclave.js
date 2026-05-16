@@ -52,7 +52,15 @@
         onChange(this);
       },
     };
-    m.load();
+    // Populate synchronously so consumers can read `m.table` immediately,
+    // but defer the first onChange — consumers typically assign the return
+    // value to a `const` and reference that name from inside onChange, which
+    // would be in the TDZ during synchronous construction.
+    try {
+      const j = localStorage.getItem(storageKey);
+      m.table = j ? JSON.parse(j) : { ...defaults };
+    } catch { m.table = { ...defaults }; }
+    queueMicrotask(() => onChange(m));
     return m;
   }
 
