@@ -11,9 +11,30 @@ WebHID, turns presses into MIDI or piano samples — no driver, no DAW required.
 
 ```
 keyclave/
-├── clave.html         — MIDI output + sampler scaffold
+├── keyclave.js        — reusable layer (HID protocol + Detector + Mapping)
+├── clave.html         — MIDI output (with aftertouch) + sampler scaffold
 ├── clave-piano.html   — direct piano sampler with sustain pedal
 └── README.md
+```
+
+Both HTML files are thin shells over `keyclave.js`; load it with a plain
+`<script src="keyclave.js"></script>` (no build, no module loader). Use it
+from your own page:
+
+```html
+<script src="keyclave.js"></script>
+<script>
+  KC.F68.log = console.log;
+  const mapping  = KC.makeMapping();          // localStorage-backed
+  const detector = KC.makeDetector({
+    getThresholds: () => ({ arm: 60, fire: 280, release: 30, vmax: 12 }),
+  });
+  detector.onPress    = (key, vel) => console.log('press', key, vel);
+  detector.onRelease  = (key)      => console.log('release', key);
+  detector.onPressure = (key, val) => console.log('pressure', key, val);
+  await KC.F68.connect();
+  KC.F68.startPolling((bank, data) => detector.processFrame(bank, data));
+</script>
 ```
 
 ### Data flow
@@ -53,6 +74,22 @@ Open the file in Chrome (works straight from `file://`), then:
 - **Release** depth (default 30) — drop below this to end the note.
 - **Vmax** (default 12) — peak dv/dt that maps to MIDI velocity 127. Hard hits
   faster than this fire *early* (before reaching Fire depth) for lower latency.
+
+### MIDI aftertouch (clave.html)
+
+While a note is held, the detector streams the current depth past the fire
+threshold as a 0–127 value. Pick how to send it:
+
+- **off** — no aftertouch.
+- **polyphonic aftertouch** (`0xA0 note value`) — per-note. Best fit for
+  expressive synths and samplers that respond to it.
+- **channel pressure** (`0xD0 value`) — one value per channel; whichever
+  note was most recently updated wins.
+- **CC** (`0xB0 cc value`) — useful when you want to drive a specific
+  parameter (CC 74 brightness, CC 11 expression, etc.).
+
+The detector throttles by suppressing emits when the quantized 7-bit value
+hasn't changed, so the MIDI bus doesn't get spammed at the polling rate.
 
 Per-key state machine:
 

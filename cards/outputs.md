@@ -1,6 +1,6 @@
 # outputs
 
-Pluggable backends that turn `(midi, velocity)` into sound or MIDI traffic. Section 4 of both HTML files. `clave.html` has a full `Output` abstraction; `clave-piano.html` skips it and exposes a single `Piano` object.
+Pluggable backends that turn `(midi, velocity)` and pressure updates into sound or MIDI traffic. `clave.html` has a full `Output` abstraction; `clave-piano.html` skips it and exposes a single `Piano` object.
 
 ## Contract
 
@@ -11,6 +11,7 @@ class Output {
   async stop()  {}
   noteOn(midi, velocity)  {}
   noteOff(midi)           {}
+  aftertouch(midi, value) {}   // value 0..127, called as held depth changes
 }
 ```
 
@@ -34,6 +35,21 @@ Wraps `navigator.requestMIDIAccess({ sysex: false })`. Picks the **first** avail
 
 Permission prompt fires at `start()` time. On macOS, the IAC Driver typically appears as an output once enabled in Audio MIDI Setup.
 
+### Aftertouch
+
+`MidiOutput.aftertouch(midi, value)` reads the aftertouch mode from the UI:
+
+| Mode      | Sends                                          |
+| --------- | ---------------------------------------------- |
+| `off`     | nothing                                        |
+| `poly`    | `[0xA0 | ch, note, value]` — polyphonic AT     |
+| `channel` | `[0xD0 | ch, value]` — channel pressure        |
+| `cc`      | `[0xB0 | ch, ccNumber, value]` — Control Change |
+
+Polyphonic aftertouch is the closest fit when the receiver supports it (per-note resolution). Channel pressure is the most widely supported but collapses all held notes' aftertouch to one stream — useful for monophonic playing, lossy for polyphonic. CC mode is for driving specific synth parameters (CC 74 brightness, CC 11 expression, CC 1 mod wheel, etc.); the CC number is editable in the UI.
+
+The Detector already throttles by suppressing emits when the quantized 7-bit value hasn't changed, so the MIDI bus only sees one message per discernible pressure step.
+
 ## SamplerOutput (clave.html scaffold)
 
 Web Audio backend with a 2-osc placeholder synth (triangle + sine an octave up) so the audio path is verifiable end-to-end without samples. `loadSamples(urlMap)` decodes a `{ midi: url }` map and switches `noteOn` to the sample path automatically — nearest pitch wins, detune via `playbackRate = 2^((target - sampleMidi) / 12)`.
@@ -56,10 +72,11 @@ Specific to this object:
 ```js
 class MyOutput extends Output {
   constructor() { super('my'); }
-  async start()       { /* connect, request perms */ this.ready = true; }
-  async stop()        { /* tear down */; this.ready = false; }
-  noteOn(midi, vel)   { if (!this.ready) return; /* play */ }
-  noteOff(midi)       { if (!this.ready) return; /* stop */ }
+  async start()         { /* connect, request perms */ this.ready = true; }
+  async stop()          { /* tear down */; this.ready = false; }
+  noteOn(midi, vel)     { if (!this.ready) return; /* play */ }
+  noteOff(midi)         { if (!this.ready) return; /* stop */ }
+  aftertouch(midi, val) { if (!this.ready) return; /* optional */ }
 }
 // in outputFor():
 if (mode === 'my') return new MyOutput();
@@ -67,8 +84,9 @@ if (mode === 'my') return new MyOutput();
 // <option value="my">My output</option>
 ```
 
-Three things to remember:
+Four things to remember:
 
-- Guard `noteOn` / `noteOff` against `!this.ready` so they're safe before `start()` resolves.
+- Guard every method against `!this.ready` so they're safe before `start()` resolves.
 - `stop()` should be idempotent — the **Apply** button re-runs it on every mode switch.
 - Output is a singleton; the previous instance is stopped before a new one starts. Don't hold global state outside the instance.
+- `aftertouch` defaults to a no-op in the base class. Only implement it if your backend has somewhere to send the value.

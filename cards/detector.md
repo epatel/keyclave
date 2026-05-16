@@ -1,6 +1,6 @@
 # detector
 
-Per-key state machine that turns raw depth frames into press/release events with peak velocity. Section 6 of both HTML files; the `Detector` object.
+Per-key state machine that turns raw depth frames into press, release, and pressure events. Lives in `keyclave.js`; instantiated via `KC.makeDetector({ getThresholds, callbacks })`.
 
 ## State machine
 
@@ -9,11 +9,12 @@ stateDiagram-v2
     [*] --> idle
     idle:    depth &lt; arm
     armed:   tracking peak dv/dt
-    on:      note sounding
+    on:      note sounding (emits onPressure on quantized changes)
     idle  --> armed: depth ≥ arm AND rising
     armed --> on:    depth ≥ fire  ⟶ onPress(key, vel, peakV, depth)
     armed --> on:    peakV ≥ Vmax  ⟶ onPress  (early-fire)
     armed --> idle:  depth ≤ release
+    on    --> on:    depth changes ⟶ onPressure(key, 0..127, depth)
     on    --> idle:  depth ≤ release  ⟶ onRelease(key)
 ```
 
@@ -41,13 +42,22 @@ Both `peakV` is in units/ms (depth is 0–355, dt is milliseconds).
 Consumers wire into:
 
 ```js
-Detector.onPress   = (key, midiVel, peakV, depth) => { ... }
-Detector.onRelease = (key) => { ... }
+const detector = KC.makeDetector({ getThresholds });
+detector.onPress    = (key, midiVel, peakV, depth) => { ... };
+detector.onRelease  = (key) => { ... };
+detector.onPressure = (key, midiValue, depth) => { ... };
 ```
 
-- Callbacks are nullable; the Detector guards each call with `&& this.on...`.
-- `Detector.releaseAll()` invokes `onRelease` for every currently-on key — call it on shutdown so output backends can clear stuck notes.
+- All three are nullable; the Detector skips the work for any callback that's null. Setting only `onPressure` is wasted work (you'd want to know when notes start/stop), but the code doesn't enforce a combination.
+- `releaseAll()` invokes `onRelease` for every currently-on key — call it on shutdown so output backends can clear stuck notes.
 - `key` is the global id (`bank * 32 + slot`) — banks and slots are an implementation detail of the protocol layer; consumers should treat `key` as opaque.
+- `onPressure` fires *only* while `on[key] === 1`, *and* only when the **quantized 7-bit pressure value changes**. So at idle / pre-trigger / post-release there is no traffic, and a steadily-held key emits at most one event per 1/127th of the post-fire range. This makes it safe to wire straight to MIDI without extra throttling.
+
+## Pressure value
+
+`pressureFromDepth(depth, fire)` linearly maps `[fire, bottom]` to `[0, 127]`, clamped. So at the exact fire-depth the value is 0 and at bottom-out (~355) the value is 127. The `bottom` constant defaults to 355 (the F68 Pro's max observed depth) and is configurable via `makeDetector({ bottom })`.
+
+This is the value that gets sent for MIDI aftertouch / channel pressure / CC in `clave.html` — see the `outputs` card.
 
 ## Per-key arrays
 

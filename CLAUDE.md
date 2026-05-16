@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Browser-based velocity-sensitive keyboard for the FREE WOLF F68 Pro magnetic (Hall-effect) keyboard. Two self-contained HTML files in `clave.html` (MIDI + sampler scaffold) and `clave-piano.html` (Salamander grand with sustain pedal). No build step, no dependencies — open the file in Chrome and it runs. State (mapping, sustain key) lives in `localStorage`. See `README.md` for user-facing setup.
+Browser-based velocity-sensitive keyboard for the FREE WOLF F68 Pro magnetic (Hall-effect) keyboard. A reusable layer (`keyclave.js`, exposed as `window.KC`) holds the HID protocol, Detector, and Mapping. Two frontends consume it: `clave.html` (MIDI + sampler scaffold, with aftertouch) and `clave-piano.html` (Salamander grand with sustain pedal). No build step, no dependencies — open the HTML in Chrome and it runs. State lives in `localStorage`. See `README.md` for user-facing setup.
 
 ## Dev loop
 
@@ -23,6 +23,6 @@ Self-contained reference cards under `cards/`. Load the one whose trigger matche
 - [outputs](cards/outputs.md) — `Output` base class, MIDI routing, Web Audio sampler, adding a new backend
 - [sustain-pedal](cards/sustain-pedal.md) — sustain behaviour, pedal-key assignment, why DOM `keydown` is unavailable
 
-## Two-file invariant
+## Layering
 
-`clave.html` and `clave-piano.html` mirror each other in sections 5 (HID protocol) and 6 (Detector). When changing either, **apply the change to both and diff to confirm.** Section banners number these identically.
+Protocol and Detector live in `keyclave.js` — change them once. The HTML frontends only hold their own UI, output wiring, and (in `clave-piano.html`) the sustain pedal. They have **no shared frontend code** beyond what `KC` exposes.

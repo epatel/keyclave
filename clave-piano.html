@@ -86,70 +86,48 @@
   <div id="log"></div>
 </section>
 
+<script src="keyclave.js"></script>
 <script>
 // ============================================================================
-// 1. Defaults
-// ============================================================================
-const DEFAULT_MAPPING = {
-  "2": 48, "7": 49, "8": 50, "13": 51, "14": 52, "20": 53,
-  "25": 54, "26": 55, "31": 56, "32": 57, "37": 58, "38": 59,
-  "44": 60, "49": 61, "50": 62, "55": 63, "56": 64, "62": 65,
-  "67": 66, "68": 67, "73": 68, "74": 69, "79": 70, "80": 71,
-};
-
-// Salamander Grand Piano samples — same source as my-midi-toy.
-// Files at https://tonejs.github.io/audio/salamander/{Note}{Octave}.mp3
-const PIANO_BASE = 'https://tonejs.github.io/audio/salamander/';
-const PIANO_MIDI = [21,24,27,30,33,36,39,42,45,48,51,54,57,60,63,66,69,72,75,78,81,84,87,90,93,96,99,102,105,108];
-const NOTE_FILE  = ['C','Cs','D','Ds','E','F','Fs','G','Gs','A','As','B'];
-
-// ============================================================================
-// 2. Utilities
+// 1. UI helpers + reusable library bindings
 // ============================================================================
 const $ = id => document.getElementById(id);
 const log = (...a) => {
   const el = $('log'); el.textContent += a.join(' ') + '\n'; el.scrollTop = 1e9;
 };
-const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join(' ');
-const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
-const midiName = n => NOTE_NAMES[((n%12)+12)%12] + (Math.floor(n/12) - 1);
-const isWhite  = n => [0,2,4,5,7,9,11].includes(((n%12)+12)%12);
-const clamp = (lo, hi, v) => Math.max(lo, Math.min(hi, v));
+
+const { midiName, isWhite } = KC;
+KC.F68.log = log;
+
+const Mapping = KC.makeMapping({
+  storageKey: 'clave-map',
+  defaults: KC.DEFAULT_MAPPING,
+  onChange: () => renderMapping(),
+});
+
+const Detector = KC.makeDetector({
+  getThresholds: () => ({
+    arm:     +$('arm').value,
+    fire:    +$('fire').value,
+    release: +$('rel').value,
+    vmax:    +$('vmax').value,
+  }),
+});
 
 // ============================================================================
-// 3. Mapping
+// 2. Piano sampler — direct, no MIDI bridge
+//    Uses Salamander Grand samples served from tonejs.github.io.  Aftertouch
+//    is observed (Detector.onPressure) but not currently mapped to anything
+//    audible.  Easy hook to add filter/amp modulation later.
 // ============================================================================
-const Mapping = {
-  table: {},
-  has(k) { return k in this.table; },
-  get(k) { return this.table[k]; },
-  set(k, m) { this.table[k] = m; this.save(); },
-  remove(k) { delete this.table[k]; this.save(); },
-  clearAll() { this.table = {}; this.save(); },
-  resetToDefault() { this.table = { ...DEFAULT_MAPPING }; this.save(); },
-  save() {
-    try { localStorage.setItem('clave-map', JSON.stringify(this.table)); } catch {}
-    renderMapping();
-  },
-  load() {
-    try {
-      const j = localStorage.getItem('clave-map');
-      this.table = j ? JSON.parse(j) : { ...DEFAULT_MAPPING };
-    } catch { this.table = { ...DEFAULT_MAPPING }; }
-  },
-};
-Mapping.load();
+const PIANO_BASE = 'https://tonejs.github.io/audio/salamander/';
+const PIANO_MIDI = [21,24,27,30,33,36,39,42,45,48,51,54,57,60,63,66,69,72,75,78,81,84,87,90,93,96,99,102,105,108];
+const NOTE_FILE  = ['C','Cs','D','Ds','E','F','Fs','G','Gs','A','As','B'];
 
-// ============================================================================
-// 4. Piano sampler — direct, no MIDI bridge
-//    On start: build AudioContext, kick off async sample loads.
-//    noteOn picks the nearest-loaded sample and detunes via playbackRate.
-//    Per-note voice tracking so noteOff can apply a release envelope.
-// ============================================================================
 const Piano = {
   ctx: null,
   master: null,
-  voices: new Map(),   // midi → { source, gain, releaseAt }
+  voices: new Map(),
   samples: PIANO_MIDI.map(m => ({
     midi: m,
     name: NOTE_FILE[m % 12] + (Math.floor(m / 12) - 1),
@@ -167,7 +145,6 @@ const Piano = {
     log('audio context started @', this.ctx.sampleRate, 'Hz');
     this.loadSamples();
   },
-
   loadSamples() {
     if (this.loading) return;
     this.loading = true;
@@ -185,7 +162,6 @@ const Piano = {
     $('loadText').textContent = `${this.loaded} / ${total} samples` + (this.failed ? ` (${this.failed} failed)` : '');
     $('loadBar').firstElementChild.style.width = (done / total * 100).toFixed(1) + '%';
   },
-
   nearestSample(midi) {
     let best = null, bestDist = Infinity;
     for (const s of this.samples) {
@@ -195,18 +171,17 @@ const Piano = {
     }
     return best;
   },
-
   noteOn(midi, vel) {
     if (!this.ctx) return;
-    this.noteOff(midi);          // cut any held voice on this note
+    this.noteOff(midi);
     const sample = this.nearestSample(midi);
-    if (!sample) return;          // samples still loading
+    if (!sample) return;
     const now = this.ctx.currentTime;
     const src = this.ctx.createBufferSource();
     src.buffer = sample.buffer;
     src.playbackRate.value = Math.pow(2, (midi - sample.midi) / 12);
     const gain = this.ctx.createGain();
-    gain.gain.value = (vel / 127) ** 1.4 * 0.95;   // slightly perceptual taper
+    gain.gain.value = (vel / 127) ** 1.4 * 0.95;
     src.connect(gain).connect(this.master);
     src.start(now);
     this.voices.set(midi, { source: src, gain });
@@ -222,200 +197,57 @@ const Piano = {
     v.gain.gain.exponentialRampToValueAtTime(0.0001, now + tail);
     try { v.source.stop(now + tail + 0.05); } catch {}
   },
-  setVolume(v) {
-    if (this.master) this.master.gain.value = v;
-  },
+  setVolume(v) { if (this.master) this.master.gain.value = v; },
 };
 
 // ============================================================================
-// 5. HID protocol — FREE WOLF F68 Pro
+// 3. Sustain pedal (designated physical key from the analog stream)
 // ============================================================================
-const F68 = {
-  VID: 0x3151, PID: 0x5029,
-  devIn: null, devOut: null,
-  featId: 0, featLen: 64,
-  polling: false, pollCount: 0,
+const activeNotes = new Set();
+function updateActive() {
+  $('active').textContent = [...activeNotes].sort((a, b) => a - b).map(midiName).join(' ');
+}
 
-  pkt(...b) {
-    const a = new Uint8Array(this.featLen);
-    for (let i = 0; i < Math.min(b.length, 7); i++) a[i] = b[i];
-    let s = 0;
-    for (let i = 0; i < 7; i++) s += a[i];
-    a[7] = (0xff - s) & 0xff;
-    return a;
+const Sustain = {
+  key: null, setting: false, active: false,
+  held: new Set(),
+  load() {
+    const v = localStorage.getItem('clave-sustain-key');
+    this.key = v === null ? null : +v;
+    this.refresh();
   },
-  async sendFeat(b) { await this.devOut.sendFeatureReport(this.featId, b); },
-  async recvFeat()  { return new Uint8Array((await this.devOut.receiveFeatureReport(this.featId)).buffer); },
-  waitInput(pred, timeoutMs = 1500) {
-    return new Promise(resolve => {
-      let done = false;
-      const handler = ev => {
-        const b = new Uint8Array(ev.data.buffer);
-        if (pred(b, ev.reportId)) {
-          done = true;
-          this.devIn.removeEventListener('inputreport', handler);
-          resolve(b);
-        }
-      };
-      this.devIn.addEventListener('inputreport', handler);
-      setTimeout(() => {
-        if (!done) { this.devIn.removeEventListener('inputreport', handler); resolve(null); }
-      }, timeoutMs);
-    });
+  save() {
+    if (this.key === null) localStorage.removeItem('clave-sustain-key');
+    else localStorage.setItem('clave-sustain-key', String(this.key));
   },
-
-  async connect() {
-    let ds = await navigator.hid.requestDevice({
-      filters: [
-        { vendorId: this.VID, productId: this.PID, usagePage: 0xffff, usage: 1 },
-        { vendorId: this.VID, productId: this.PID, usagePage: 0xffff, usage: 2 },
-      ],
-    });
-    if (!ds.length) ds = await navigator.hid.requestDevice({
-      filters: [{ vendorId: this.VID, productId: this.PID }],
-    });
-    if (!ds.length) return false;
-    for (const d of ds) {
-      if (!d.opened) await d.open();
-      log('opened', d.productName);
-    }
-
-    const reportSize = r => Math.ceil(((r.items || [])
-      .reduce((s, it) => s + (it.reportSize || 0) * (it.reportCount || 0), 0)) / 8);
-    this.devOut = ds.find(d => d.collections.some(c =>
-      c.usagePage === 0xffff && (c.featureReports || []).length)) || ds[0];
-    this.devIn = ds.find(d => d.collections.some(c =>
-      c.usagePage === 0xffff && (c.inputReports || []).some(r => r.reportId === 5))) || ds[0];
-    const vendorColl = this.devOut.collections.find(c =>
-      c.usagePage === 0xffff && (c.featureReports || []).length);
-    const fr = vendorColl && vendorColl.featureReports[0];
-    if (fr) { this.featId = fr.reportId | 0; this.featLen = reportSize(fr) || 64; }
-
-    this.devIn.addEventListener('inputreport', e => {
-      if (e.reportId !== 5) return;
-      log('← state', hex(new Uint8Array(e.data.buffer).slice(0, 2)));
-    });
-    await this.enable();
-    return true;
+  refresh() {
+    $('sustainKeyLabel').textContent = this.setting
+      ? 'press a key now…'
+      : (this.key !== null ? `key ${this.key} (bank ${this.key>>5}/slot ${this.key&31})` : 'none assigned');
   },
-
-  async enable() {
-    $('status').textContent = 'enabling';
-    log('→ 1c 01');
-    await this.sendFeat(this.pkt(0x1c, 0x01));
-    await new Promise(r => setTimeout(r, 150));
-    log('→ 1c 00');
-    const p1 = this.waitInput(b => b[0] === 0x0f && b[1] === 0x01);
-    await this.sendFeat(this.pkt(0x1c, 0x00));
-    await p1;
-    await this.waitInput(b => b[0] === 0x0f && b[1] === 0x00, 500);
-    log('→ 1e 01 (streaming)');
-    await this.sendFeat(this.pkt(0x1e, 0x01));
-    await new Promise(r => setTimeout(r, 50));
-    $('status').textContent = 'streaming';
-  },
-  async disable() { try { await this.sendFeat(this.pkt(0x1e, 0x00)); } catch {} },
-
-  async startPolling(onFrame) {
-    this.polling = true; this.pollCount = 0;
-    let bank = 0;
-    let consecutiveErrors = 0;
-    const MAX_ERRORS = 8;
-    while (this.polling && this.devOut && this.devOut.opened) {
-      try {
-        await this.sendFeat(this.pkt(0xe5, 0xfe, 0x01, bank));
-        onFrame(bank, await this.recvFeat());
-        consecutiveErrors = 0;
-        if (++this.pollCount % 32 === 0) $('polls').textContent = this.pollCount + ' polls';
-      } catch (err) {
-        consecutiveErrors++;
-        if (consecutiveErrors === 1) log('poll hiccup:', err.message, '(retrying)');
-        if (consecutiveErrors >= MAX_ERRORS) {
-          log(`poll failed ${consecutiveErrors}× — giving up. Hit Stop / Connect to retry.`);
-          $('status').textContent = 'lost device';
-          break;
-        }
-        await new Promise(r => setTimeout(r, 20 * consecutiveErrors));  // backoff
+  startSet() { this.setting = true; this.refresh(); },
+  clear()    { this.key = null; this.setting = false; this.save(); this.refresh(); },
+  assign(k)  { this.key = k; this.setting = false; this.save(); this.refresh(); log('sustain pedal =', k); },
+  set(on) {
+    if (this.active === on) return;
+    this.active = on;
+    $('sustainPill').style.visibility = on ? 'visible' : 'hidden';
+    if (!on) {
+      for (const midi of this.held) {
+        Piano.noteOff(midi);
+        activeNotes.delete(midi);
       }
-      bank = (bank + 1) & 3;
-      await new Promise(r => setTimeout(r, 2));
-    }
-    this.polling = false;
-  },
-
-  async shutdown() {
-    this.polling = false;
-    if (this.devOut) await this.disable();
-    for (const d of [this.devIn, this.devOut]) {
-      if (!d) continue;
-      try { await d.close(); } catch {}
-    }
-    this.devIn = this.devOut = null;
-  },
-};
-
-// ============================================================================
-// 6. Detector
-// ============================================================================
-const NKEYS = 128;
-const Detector = {
-  prevDepth: new Int16Array(NKEYS),
-  lastT:     new Float64Array(NKEYS),
-  peakVel:   new Float32Array(NKEYS),
-  armed:     new Uint8Array(NKEYS),
-  on:        new Uint8Array(NKEYS),
-  onPress: null, onRelease: null,
-
-  velocityFromPeak(peak) {
-    const VMIN = 0.4, VMAX = +$('vmax').value || 12;
-    return clamp(1, 127, Math.round((peak - VMIN) / (VMAX - VMIN) * 107 + 20));
-  },
-
-  processFrame(bank, data) {
-    const now = performance.now();
-    const arm = +$('arm').value, fire = +$('fire').value, rel = +$('rel').value;
-    const vmax = +$('vmax').value;
-    for (let slot = 0; slot < 32; slot++) {
-      const off = slot * 2;
-      if (off + 1 >= data.length) break;
-      const d = data[off] | (data[off + 1] << 8);
-      const key = bank * 32 + slot;
-      const p = this.prevDepth[key];
-      const lt = this.lastT[key];
-
-      let dv = 0;
-      if (lt) dv = (d - p) / Math.max(0.5, now - lt);
-      this.lastT[key] = now;
-      this.prevDepth[key] = d;
-      if (dv > this.peakVel[key]) this.peakVel[key] = dv;
-
-      if (!this.on[key]) {
-        if (!this.armed[key] && d >= arm && d > p) this.armed[key] = 1;
-        if (this.armed[key] && (d >= fire || this.peakVel[key] >= vmax)) {
-          this.on[key] = 1;
-          this.armed[key] = 0;
-          const v = this.velocityFromPeak(this.peakVel[key]);
-          this.onPress && this.onPress(key, v, this.peakVel[key], d);
-        }
-      } else if (d <= rel) {
-        this.on[key] = 0;
-        this.armed[key] = 0;
-        this.peakVel[key] = 0;
-        this.onRelease && this.onRelease(key);
-      }
-    }
-  },
-
-  releaseAll() {
-    for (let k = 0; k < NKEYS; k++) {
-      if (this.on[k] && this.onRelease) this.onRelease(k);
-      this.on[k] = 0; this.armed[k] = 0; this.peakVel[k] = 0;
+      this.held.clear();
+      updateActive();
     }
   },
 };
+Sustain.load();
+$('setSustain').onclick   = () => Sustain.startSet();
+$('clearSustain').onclick = () => Sustain.clear();
 
 // ============================================================================
-// 7. Calibration
+// 4. Calibration
 // ============================================================================
 const Calibration = {
   active: false, target: 48,
@@ -456,7 +288,7 @@ const Calibration = {
 };
 
 // ============================================================================
-// 8. UI wiring
+// 5. UI wiring
 // ============================================================================
 function renderMapping() {
   const rows = ['<table><tr><th>key</th><th>bank/slot</th><th>MIDI</th><th>note</th></tr>'];
@@ -470,64 +302,13 @@ function renderMapping() {
   $('mapping').innerHTML = rows.join('');
 }
 
-const activeNotes = new Set();
-function updateActive() {
-  $('active').textContent = [...activeNotes].sort((a, b) => a - b).map(midiName).join(' ');
-}
-
-// ---- Sustain pedal (a designated physical key on the F68) ----
-// The F68 stops sending normal HID keystrokes while streaming, so we can't
-// use a DOM Space listener.  Instead the user picks one of the analog keys
-// to act as the pedal; while it's pressed, releases are deferred.
-const Sustain = {
-  key: null,            // physical key id assigned as pedal (null = none)
-  setting: false,       // listening for the next press to record the pedal
-  active: false,
-  held: new Set(),      // midi notes whose physical key was released, held by pedal
-
-  load() {
-    const v = localStorage.getItem('clave-sustain-key');
-    this.key = v === null ? null : +v;
-    this.refresh();
-  },
-  save() {
-    if (this.key === null) localStorage.removeItem('clave-sustain-key');
-    else localStorage.setItem('clave-sustain-key', String(this.key));
-  },
-  refresh() {
-    $('sustainKeyLabel').textContent = this.setting
-      ? 'press a key now…'
-      : (this.key !== null ? `key ${this.key} (bank ${this.key>>5}/slot ${this.key&31})` : 'none assigned');
-  },
-  startSet()  { this.setting = true; this.refresh(); },
-  clear()     { this.key = null; this.setting = false; this.save(); this.refresh(); },
-  assign(k)   { this.key = k; this.setting = false; this.save(); this.refresh(); log('sustain pedal =', k); },
-
-  set(on) {
-    if (this.active === on) return;
-    this.active = on;
-    $('sustainPill').style.visibility = on ? 'visible' : 'hidden';
-    if (!on) {
-      for (const midi of this.held) {
-        Piano.noteOff(midi);
-        activeNotes.delete(midi);
-      }
-      this.held.clear();
-      updateActive();
-    }
-  },
-};
-Sustain.load();
-$('setSustain').onclick   = () => Sustain.startSet();
-$('clearSustain').onclick = () => Sustain.clear();
-
 Detector.onPress = (key, vel, peakV, depth) => {
   if (Sustain.setting) { Sustain.assign(key); return; }
   if (key === Sustain.key) { Sustain.set(true); return; }
   if (Calibration.active) { Calibration.record(key); return; }
   if (!Mapping.has(key)) return;
   const midi = Mapping.get(key);
-  Sustain.held.delete(midi);     // re-pressing returns it to "physically held"
+  Sustain.held.delete(midi);
   Piano.noteOn(midi, vel);
   activeNotes.add(midi);
   updateActive();
@@ -546,14 +327,21 @@ Detector.onRelease = (key) => {
     updateActive();
   }
 };
+// Detector.onPressure intentionally unset for now — easy hook to drive
+// filter, amp, or velocity-curve modulation off held depth.
 
 $('connect').onclick = async () => {
   $('connect').disabled = true;
   try {
-    const ok = await F68.connect();
-    if (!ok) { $('connect').disabled = false; return; }
+    $('status').textContent = 'connecting';
+    const ok = await KC.F68.connect();
+    if (!ok) { $('connect').disabled = false; $('status').textContent = 'disconnected'; return; }
+    $('status').textContent = 'streaming';
     $('stop').disabled = false;
-    F68.startPolling((bank, data) => Detector.processFrame(bank, data));
+    KC.F68.startPolling(
+      (bank, data) => Detector.processFrame(bank, data),
+      (count) => { $('polls').textContent = count + ' polls'; },
+    );
   } catch (err) {
     log('connect failed:', err.message);
     $('status').textContent = 'error';
@@ -562,20 +350,17 @@ $('connect').onclick = async () => {
 };
 $('stop').onclick = async () => {
   Detector.releaseAll();
-  await F68.shutdown();
+  await KC.F68.shutdown();
   activeNotes.clear();
   updateActive();
   $('status').textContent = 'disconnected';
   $('connect').disabled = false;
   $('stop').disabled = true;
 };
-window.addEventListener('beforeunload', () => F68.shutdown());
+window.addEventListener('beforeunload', () => KC.F68.shutdown());
 
-$('audio').onclick = () => {
-  Piano.start();
-  $('audio').disabled = true;
-};
-$('vol').oninput = () => Piano.setVolume(+$('vol').value);
+$('audio').onclick = () => { Piano.start(); $('audio').disabled = true; };
+$('vol').oninput   = () => Piano.setVolume(+$('vol').value);
 
 $('cal').onclick      = () => Calibration.start();
 $('calSkip').onclick  = () => Calibration.skip();
@@ -603,8 +388,7 @@ $('mapLoadInput').onchange = async ev => {
   const f = ev.target.files[0];
   if (!f) return;
   try {
-    Mapping.table = JSON.parse(await f.text());
-    Mapping.save();
+    Mapping.replace(JSON.parse(await f.text()));
     Calibration.refresh();
     log('loaded mapping:', Object.keys(Mapping.table).length, 'keys');
   } catch (err) {

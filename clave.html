@@ -63,6 +63,17 @@
     <button id="outApply">Apply</button>
     <span class="pill" id="outStatus">off</span>
   </div>
+  <div class="row" style="font-size:.9em;color:#555">
+    <label>Aftertouch
+      <select id="atMode">
+        <option value="off" selected>off</option>
+        <option value="poly">polyphonic aftertouch (0xA0)</option>
+        <option value="channel">channel pressure (0xD0)</option>
+        <option value="cc">CC</option>
+      </select>
+    </label>
+    <label>CC# <input id="atCC" type="number" min="0" max="127" value="74" /></label>
+  </div>
   <div id="active"></div>
 </section>
 
@@ -90,20 +101,10 @@
   <div id="log"></div>
 </section>
 
+<script src="keyclave.js"></script>
 <script>
 // ============================================================================
-// 1. Default key-id → MIDI mapping (24 keys, C3–B4).  Overridden by
-//    localStorage and by Load JSON.
-// ============================================================================
-const DEFAULT_MAPPING = {
-  "2": 48, "7": 49, "8": 50, "13": 51, "14": 52, "20": 53,
-  "25": 54, "26": 55, "31": 56, "32": 57, "37": 58, "38": 59,
-  "44": 60, "49": 61, "50": 62, "55": 63, "56": 64, "62": 65,
-  "67": 66, "68": 67, "73": 68, "74": 69, "79": 70, "80": 71,
-};
-
-// ============================================================================
-// 2. Utilities
+// 1. UI helpers + reusable library bindings
 // ============================================================================
 const $ = id => document.getElementById(id);
 const log = (...a) => {
@@ -111,41 +112,28 @@ const log = (...a) => {
   el.textContent += a.join(' ') + '\n';
   el.scrollTop = 1e9;
 };
-const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join(' ');
-const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
-const midiName = n => NOTE_NAMES[((n%12)+12)%12] + (Math.floor(n/12) - 1);
-const isWhite  = n => [0,2,4,5,7,9,11].includes(((n%12)+12)%12);
-const clamp = (lo, hi, v) => Math.max(lo, Math.min(hi, v));
+
+const { midiName, isWhite } = KC;
+KC.F68.log = log;
+
+const Mapping = KC.makeMapping({
+  storageKey: 'clave-map',
+  defaults: KC.DEFAULT_MAPPING,
+  onChange: () => renderMapping(),
+});
+
+const Detector = KC.makeDetector({
+  getThresholds: () => ({
+    arm:     +$('arm').value,
+    fire:    +$('fire').value,
+    release: +$('rel').value,
+    vmax:    +$('vmax').value,
+  }),
+});
 
 // ============================================================================
-// 3. Mapping module — physical key id → MIDI note
-// ============================================================================
-const Mapping = {
-  table: {},
-  has(key)         { return key in this.table; },
-  get(key)         { return this.table[key]; },
-  set(key, midi)   { this.table[key] = midi; this.save(); },
-  remove(key)      { delete this.table[key];  this.save(); },
-  clearAll()       { this.table = {};                    this.save(); },
-  resetToDefault() { this.table = { ...DEFAULT_MAPPING }; this.save(); },
-  save() {
-    try { localStorage.setItem('clave-map', JSON.stringify(this.table)); } catch {}
-    renderMapping();
-  },
-  load() {
-    try {
-      const j = localStorage.getItem('clave-map');
-      this.table = j ? JSON.parse(j) : { ...DEFAULT_MAPPING };
-    } catch {
-      this.table = { ...DEFAULT_MAPPING };
-    }
-  },
-};
-Mapping.load();
-
-// ============================================================================
-// 4. Output abstraction — pluggable backends.  Add new ones by subclassing
-//    Output and registering them in `outputFor()` below.
+// 2. Output abstraction — pluggable backends.  Add new ones by subclassing
+//    Output and registering in `outputFor()` below.
 // ============================================================================
 class Output {
   constructor(name) { this.ready = false; this.name = name; }
@@ -153,6 +141,7 @@ class Output {
   async stop()  {}
   noteOn(midi, velocity)  {}
   noteOff(midi)           {}
+  aftertouch(midi, value) {}   // value 0..127
 }
 
 class MidiOutput extends Output {
@@ -166,15 +155,24 @@ class MidiOutput extends Output {
     log('MIDI out:', this.port.name);
   }
   async stop() { this.port = null; this.ready = false; }
+  ch() { return (+$('ch').value - 1) & 15; }
   noteOn(midi, vel) {
     if (!this.ready) return;
-    const ch = (+$('ch').value - 1) & 15;
-    this.port.send([0x90 | ch, midi & 127, vel & 127]);
+    this.port.send([0x90 | this.ch(), midi & 127, vel & 127]);
   }
   noteOff(midi) {
     if (!this.ready) return;
-    const ch = (+$('ch').value - 1) & 15;
-    this.port.send([0x80 | ch, midi & 127, 0]);
+    this.port.send([0x80 | this.ch(), midi & 127, 0]);
+  }
+  aftertouch(midi, v) {
+    if (!this.ready) return;
+    const mode = $('atMode').value;
+    if (mode === 'off') return;
+    const ch = this.ch();
+    const value = v & 127;
+    if (mode === 'poly')         this.port.send([0xA0 | ch, midi & 127, value]);   // polyphonic aftertouch
+    else if (mode === 'channel') this.port.send([0xD0 | ch, value]);                // channel pressure
+    else if (mode === 'cc')      this.port.send([0xB0 | ch, (+$('atCC').value) & 127, value]);
   }
 }
 
@@ -182,14 +180,8 @@ class MidiOutput extends Output {
 // is verified end-to-end.  To make it sound like a piano, call
 // `output.loadSamples({60: 'C4.mp3', 64: 'E4.mp3', ...})` after starting.
 //
-// Suggested CC-licensed piano sample sets to plug in:
-//   • Salamander Grand Piano V3            (CC-BY)
-//   • VSCO 2 Community Edition Piano       (CC0)
-//   • https://nbrosowsky.github.io/tonejs-instruments/samples/piano/
-//     (Salamander mirror, mp3/ogg per note)
-//
-// Format: { midiNote: 'url', ... }.  noteOn finds the nearest sample and
-// detunes it via playbackRate.
+// Aftertouch is unused here today; a real implementation could modulate a
+// filter or amp envelope from the value.
 class SamplerOutput extends Output {
   constructor() {
     super('sampler');
@@ -227,7 +219,6 @@ class SamplerOutput extends Output {
     const now = this.ctx.currentTime;
     const gain = this.ctx.createGain();
     gain.connect(this.master);
-
     const samplePitches = Object.keys(this.samples).map(Number);
     if (samplePitches.length) {
       const nearest = samplePitches.reduce((a, b) =>
@@ -240,7 +231,6 @@ class SamplerOutput extends Output {
       src.start(now);
       this.voices.set(midi, { source: src, gain });
     } else {
-      // Placeholder synth — two-osc piano-ish, no real piano character.
       const freq = 440 * Math.pow(2, (midi - 69) / 12);
       const o1 = this.ctx.createOscillator(); o1.type = 'triangle'; o1.frequency.value = freq;
       const o2 = this.ctx.createOscillator(); o2.type = 'sine';     o2.frequency.value = freq * 2;
@@ -250,8 +240,7 @@ class SamplerOutput extends Output {
       gain.gain.linearRampToValueAtTime(peak, now + 0.005);
       gain.gain.exponentialRampToValueAtTime(peak * 0.4, now + 0.25);
       gain.gain.exponentialRampToValueAtTime(0.0001, now + 2.5);
-      o1.connect(gain);
-      o2.connect(gain);
+      o1.connect(gain); o2.connect(gain);
       o1.start(now); o2.start(now);
       o1.stop(now + 3); o2.stop(now + 3);
       this.voices.set(midi, { source: o1, gain });
@@ -274,221 +263,13 @@ function outputFor(mode) {
   if (mode === 'sampler') return new SamplerOutput();
   return null;
 }
-
 let output = null;
 
 // ============================================================================
-// 5. HID protocol — FREE WOLF F68 Pro
-//    Two interfaces: commands → devOut (vendor ffff/2, feature reports);
-//    mode acks ← devIn (vendor ffff/1, input report id=5).
-// ============================================================================
-const F68 = {
-  VID: 0x3151,
-  PID: 0x5029,
-  devIn: null, devOut: null,
-  featId: 0, featLen: 64,
-  polling: false, pollCount: 0,
-
-  pkt(...b) {
-    const a = new Uint8Array(this.featLen);
-    for (let i = 0; i < Math.min(b.length, 7); i++) a[i] = b[i];
-    let s = 0;
-    for (let i = 0; i < 7; i++) s += a[i];
-    a[7] = (0xff - s) & 0xff;
-    return a;
-  },
-  async sendFeat(bytes) { await this.devOut.sendFeatureReport(this.featId, bytes); },
-  async recvFeat() {
-    return new Uint8Array((await this.devOut.receiveFeatureReport(this.featId)).buffer);
-  },
-  waitInput(pred, timeoutMs = 1500) {
-    return new Promise(resolve => {
-      let done = false;
-      const handler = ev => {
-        const b = new Uint8Array(ev.data.buffer);
-        if (pred(b, ev.reportId)) {
-          done = true;
-          this.devIn.removeEventListener('inputreport', handler);
-          resolve(b);
-        }
-      };
-      this.devIn.addEventListener('inputreport', handler);
-      setTimeout(() => {
-        if (!done) {
-          this.devIn.removeEventListener('inputreport', handler);
-          resolve(null);
-        }
-      }, timeoutMs);
-    });
-  },
-
-  async connect() {
-    let ds = await navigator.hid.requestDevice({
-      filters: [
-        { vendorId: this.VID, productId: this.PID, usagePage: 0xffff, usage: 1 },
-        { vendorId: this.VID, productId: this.PID, usagePage: 0xffff, usage: 2 },
-      ],
-    });
-    if (!ds.length) ds = await navigator.hid.requestDevice({
-      filters: [{ vendorId: this.VID, productId: this.PID }],
-    });
-    if (!ds.length) return false;
-
-    for (const d of ds) {
-      if (!d.opened) await d.open();
-      log('opened', d.productName);
-    }
-
-    const reportSize = r => Math.ceil(((r.items || [])
-      .reduce((s, it) => s + (it.reportSize || 0) * (it.reportCount || 0), 0)) / 8);
-
-    this.devOut = ds.find(d => d.collections.some(c =>
-      c.usagePage === 0xffff && (c.featureReports || []).length)) || ds[0];
-    this.devIn = ds.find(d => d.collections.some(c =>
-      c.usagePage === 0xffff && (c.inputReports || []).some(r => r.reportId === 5))) || ds[0];
-
-    const vendorColl = this.devOut.collections.find(c =>
-      c.usagePage === 0xffff && (c.featureReports || []).length);
-    const fr = vendorColl && vendorColl.featureReports[0];
-    if (fr) {
-      this.featId = fr.reportId | 0;
-      this.featLen = reportSize(fr) || 64;
-    }
-    log(`feature report id=${this.featId} len=${this.featLen}`);
-
-    this.devIn.addEventListener('inputreport', e => {
-      if (e.reportId !== 5) return;
-      const b = new Uint8Array(e.data.buffer);
-      log('← state', hex(b.slice(0, 2)));
-    });
-
-    await this.enable();
-    return true;
-  },
-
-  async enable() {
-    $('status').textContent = 'enabling';
-    log('→ 1c 01');
-    await this.sendFeat(this.pkt(0x1c, 0x01));
-    await new Promise(r => setTimeout(r, 150));
-    log('→ 1c 00');
-    const p1 = this.waitInput(b => b[0] === 0x0f && b[1] === 0x01);
-    await this.sendFeat(this.pkt(0x1c, 0x00));
-    await p1;
-    await this.waitInput(b => b[0] === 0x0f && b[1] === 0x00, 500);
-    log('→ 1e 01 (streaming)');
-    await this.sendFeat(this.pkt(0x1e, 0x01));
-    await new Promise(r => setTimeout(r, 50));
-    $('status').textContent = 'streaming';
-  },
-  async disable() {
-    try { await this.sendFeat(this.pkt(0x1e, 0x00)); } catch {}
-  },
-
-  async startPolling(onFrame) {
-    this.polling = true;
-    this.pollCount = 0;
-    let bank = 0;
-    while (this.polling && this.devOut && this.devOut.opened) {
-      try {
-        await this.sendFeat(this.pkt(0xe5, 0xfe, 0x01, bank));
-        const resp = await this.recvFeat();
-        onFrame(bank, resp);
-        if (++this.pollCount % 32 === 0) $('polls').textContent = this.pollCount + ' polls';
-      } catch (err) {
-        log('poll error:', err.message);
-        break;
-      }
-      bank = (bank + 1) & 3;
-      await new Promise(r => setTimeout(r, 2));
-    }
-    this.polling = false;
-  },
-
-  async shutdown() {
-    this.polling = false;
-    if (this.devOut) await this.disable();
-    for (const d of [this.devIn, this.devOut]) {
-      if (!d) continue;
-      try { await d.close(); } catch {}
-    }
-    this.devIn = this.devOut = null;
-  },
-};
-
-// ============================================================================
-// 6. Detector — analyzes poll frames, emits press/release events.
-//    Subscribe via Detector.onPress / Detector.onRelease.
-// ============================================================================
-const NKEYS = 128;
-const Detector = {
-  prevDepth: new Int16Array(NKEYS),
-  lastT:     new Float64Array(NKEYS),
-  peakVel:   new Float32Array(NKEYS),
-  armed:     new Uint8Array(NKEYS),
-  on:        new Uint8Array(NKEYS),
-
-  onPress: null,   // (key, midiVelocity, peakV, depth) => void
-  onRelease: null, // (key) => void
-
-  velocityFromPeak(peak) {
-    const VMIN = 0.4, VMAX = +$('vmax').value || 12;
-    const v = (peak - VMIN) / (VMAX - VMIN) * 107 + 20;
-    return clamp(1, 127, Math.round(v));
-  },
-
-  processFrame(bank, data) {
-    const now = performance.now();
-    const arm = +$('arm').value, fire = +$('fire').value, rel = +$('rel').value;
-    const vmax = +$('vmax').value;
-    for (let slot = 0; slot < 32; slot++) {
-      const off = slot * 2;
-      if (off + 1 >= data.length) break;
-      const d = data[off] | (data[off + 1] << 8);
-      const key = bank * 32 + slot;
-      const p = this.prevDepth[key];
-      const lt = this.lastT[key];
-
-      let dv = 0;
-      if (lt) dv = (d - p) / Math.max(0.5, now - lt);
-      this.lastT[key] = now;
-      this.prevDepth[key] = d;
-      if (dv > this.peakVel[key]) this.peakVel[key] = dv;
-
-      if (!this.on[key]) {
-        if (!this.armed[key] && d >= arm && d > p) this.armed[key] = 1;
-        if (this.armed[key] && (d >= fire || this.peakVel[key] >= vmax)) {
-          this.on[key] = 1;
-          this.armed[key] = 0;
-          const v = this.velocityFromPeak(this.peakVel[key]);
-          this.onPress && this.onPress(key, v, this.peakVel[key], d);
-        }
-      } else if (d <= rel) {
-        this.on[key] = 0;
-        this.armed[key] = 0;
-        this.peakVel[key] = 0;
-        this.onRelease && this.onRelease(key);
-      }
-    }
-  },
-
-  releaseAll() {
-    for (let k = 0; k < NKEYS; k++) {
-      if (this.on[k] && this.onRelease) this.onRelease(k);
-      this.on[k] = 0;
-      this.armed[k] = 0;
-      this.peakVel[k] = 0;
-    }
-  },
-};
-
-// ============================================================================
-// 7. Calibration — assigns the next-pressed key to the current target note
+// 3. Calibration
 // ============================================================================
 const Calibration = {
-  active: false,
-  target: 48,
-
+  active: false, target: 48,
   start() {
     this.active = true;
     this.target = +$('base').value || 48;
@@ -526,7 +307,7 @@ const Calibration = {
 };
 
 // ============================================================================
-// 8. UI wiring
+// 4. UI wiring
 // ============================================================================
 function renderMapping() {
   const rows = ['<table><tr><th>key</th><th>bank/slot</th><th>MIDI</th><th>note</th></tr>'];
@@ -562,14 +343,24 @@ Detector.onRelease = (key) => {
   activeNotes.delete(midi);
   updateActive();
 };
+Detector.onPressure = (key, value, depth) => {
+  if (Calibration.active) return;
+  if (!Mapping.has(key)) return;
+  output && output.aftertouch(Mapping.get(key), value);
+};
 
 $('connect').onclick = async () => {
   $('connect').disabled = true;
   try {
-    const ok = await F68.connect();
-    if (!ok) { $('connect').disabled = false; return; }
+    $('status').textContent = 'connecting';
+    const ok = await KC.F68.connect();
+    if (!ok) { $('connect').disabled = false; $('status').textContent = 'disconnected'; return; }
+    $('status').textContent = 'streaming';
     $('stop').disabled = false;
-    F68.startPolling((bank, data) => Detector.processFrame(bank, data));
+    KC.F68.startPolling(
+      (bank, data) => Detector.processFrame(bank, data),
+      (count) => { $('polls').textContent = count + ' polls'; },
+    );
   } catch (err) {
     log('connect failed:', err.message);
     $('status').textContent = 'error';
@@ -578,14 +369,14 @@ $('connect').onclick = async () => {
 };
 $('stop').onclick = async () => {
   Detector.releaseAll();
-  await F68.shutdown();
+  await KC.F68.shutdown();
   activeNotes.clear();
   updateActive();
   $('status').textContent = 'disconnected';
   $('connect').disabled = false;
   $('stop').disabled = true;
 };
-window.addEventListener('beforeunload', () => F68.shutdown());
+window.addEventListener('beforeunload', () => KC.F68.shutdown());
 
 $('outApply').onclick = async () => {
   if (output) { await output.stop(); output = null; }
@@ -627,8 +418,7 @@ $('mapLoadInput').onchange = async ev => {
   const f = ev.target.files[0];
   if (!f) return;
   try {
-    Mapping.table = JSON.parse(await f.text());
-    Mapping.save();
+    Mapping.replace(JSON.parse(await f.text()));
     Calibration.refresh();
     log('loaded mapping:', Object.keys(Mapping.table).length, 'keys');
   } catch (err) {
