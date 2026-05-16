@@ -26,3 +26,14 @@ Self-contained reference cards under `cards/`. Load the one whose trigger matche
 ## Layering
 
 Protocol and Detector live in `keyclave.js` — change them once. The HTML frontends only hold their own UI, output wiring, and (in `clave-piano.html`) the sustain pedal. They have **no shared frontend code** beyond what `KC` exposes.
+
+## Keep these docs current
+
+When you change code, update the docs in the same commit. They're the only way the next agent (and the next you) finds these details quickly.
+
+- **`CLAUDE.md` (this file)** — update **Overview** when the file set or top-level layering changes, **Dev loop** when the build/run story changes (it currently shouldn't), and **Context cards** when adding/removing/renaming a card. Keep it short — anything specific belongs in a card.
+- **`cards/`** — touch every card whose trigger area is affected. A change to the HID packet format hits `f68-protocol`; new Detector events hit `detector` and (likely) `architecture`; a new Output backend hits `outputs`. Honour the cards rule: **self-contained, no cross-card "see also" links** — if two cards need the same fact, hoist it into a third.
+- **`README.md`** — user-facing surface only (controls, calibration UI, knobs the user touches). Don't restate card content here.
+- **Diagrams** — when you add or change one, prefer mermaid over ASCII. The state machine in `cards/detector.md` and the dataflow in `cards/architecture.md` are the load-bearing ones; keep them honest.
+
+If you change `KC`'s public surface, also update the README "use it from your own page" example block.
