@@ -4,11 +4,28 @@ Browser-based velocity-sensitive keyboard for the **FREE WOLF F68 Pro** magnetic
 (Hall-effect) keyboard. Reads analog key depth straight off the device via
 WebHID, turns presses into MIDI or piano samples — no driver, no DAW required.
 
+> **Origin.** Picked up a FREE WOLF F68 Pro on a [really good
+> AliExpress deal](https://www.aliexpress.com/w/wholesale-free-wolf-f68-keyboard.html),
+> realised magnetic switches stream a continuous depth value per key, and went
+> down the rabbit hole. **Analog keys are fun.**
+
 ```
 keyclave/
 ├── clave.html         — MIDI output + sampler scaffold
 ├── clave-piano.html   — direct piano sampler with sustain pedal
 └── README.md
+```
+
+### Data flow
+
+```mermaid
+flowchart LR
+    KB[F68 Pro<br/>analog switches] -->|WebHID poll<br/>~250 Hz| F68[F68 protocol]
+    F68 -->|depth per key| DET[Detector<br/>arm → fire → release]
+    DET -->|press / release<br/>+ velocity| MAP[Mapping<br/>key id → MIDI]
+    MAP --> OUT{Output}
+    OUT -->|noteOn / noteOff| MIDI[MIDI port]
+    OUT -->|noteOn / noteOff| PIANO[Web Audio<br/>Salamander samples]
 ```
 
 ## Requirements
@@ -36,6 +53,21 @@ Open the file in Chrome (works straight from `file://`), then:
 - **Release** depth (default 30) — drop below this to end the note.
 - **Vmax** (default 12) — peak dv/dt that maps to MIDI velocity 127. Hard hits
   faster than this fire *early* (before reaching Fire depth) for lower latency.
+
+Per-key state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle:    depth &lt; arm
+    armed:   tracking peak dv/dt
+    on:      note sounding
+    idle  --> armed: depth ≥ arm AND rising
+    armed --> on:    depth ≥ fire  ⟶ noteOn(peak velocity)
+    armed --> on:    peakV ≥ Vmax  ⟶ noteOn(peak velocity)  (early-fire)
+    armed --> idle:  depth ≤ release
+    on    --> idle:  depth ≤ release  ⟶ noteOff
+```
 
 ### Calibration
 
@@ -82,28 +114,42 @@ Discovered by sniffing [iotdriver.qmk.top](https://iotdriver.qmk.top) with a
 WebHID overlay that monkey-patches `navigator.hid` to log every
 `sendFeatureReport` / `receiveFeatureReport` / `inputreport` call.
 
-- The device presents **two HID interfaces**. The one with vendor collection
-  `ffff/2` exposes 64-byte feature reports (id 0) for commands; the one with
-  `ffff/1` carries mode-ack input reports on id 5.
-- All command packets are 8 meaningful bytes + 56 zeros, padded to 64.
-  Byte 7 is a checksum: `0xff − sum(byte[0..6])`.
-- **Enable streaming** (host → device, all via `sendFeatureReport(0, …)`):
-  ```
-  1c 01 00 00 00 00 00 e2     # enter host control
-  1c 00 00 00 00 00 00 e3     # ack       → input 0f 01 then 0f 00
-  1e 01 00 00 00 00 00 e0     # start streaming
-  ```
-- **Disable**: `1e 00 00 00 00 00 00 e1`.
-- **Poll** (every ~3 ms, rotating bank 0…3):
-  ```
-  e5 fe 01 BANK 00 00 00 CHK
-  ```
-  Response is 64 bytes = 32 little-endian 16-bit slots. Each slot holds the
-  current depth for one key (0 = released, ~355 = bottomed out). Global key
-  id = `bank * 32 + slot`.
+The F68 Pro presents itself as **two HID interfaces** — both must be opened:
 
-Calibration mode (which this is) suspends normal HID keystroke reporting.
-The keyboard becomes a pure analog-streaming device until `1e 00` is sent.
+```mermaid
+flowchart LR
+    HOST[Browser] -->|sendFeatureReport id=0<br/>64-byte packets| OUT[devOut<br/>vendor ffff/2]
+    IN[devIn<br/>vendor ffff/1] -->|inputreport id=5<br/>state acks| HOST
+    OUT -.same physical keyboard.- IN
+```
+
+All command packets are 8 meaningful bytes + 56 zeros, padded to 64. Byte 7 is
+a checksum: `0xff − sum(byte[0..6])`. The enable handshake:
+
+```mermaid
+sequenceDiagram
+    participant H as Host
+    participant D as F68
+    H->>D: sendFeature  1c 01 ... e2   (enter host control)
+    H->>D: sendFeature  1c 00 ... e3   (ack)
+    D-->>H: input id=5  0f 01           (mode transition)
+    D-->>H: input id=5  0f 00           (ready)
+    H->>D: sendFeature  1e 01 ... e0   (start streaming)
+    loop every ~3 ms, bank = 0..3
+        H->>D: sendFeature  e5 fe 01 BANK 00 00 00 CHK
+        D-->>H: 64-byte response → 32 × uint16-LE depth slots
+    end
+    H->>D: sendFeature  1e 00 ... e1   (stop streaming)
+```
+
+Response layout: 64 bytes = 32 little-endian 16-bit slots. Each slot holds the
+current depth for one key (0 = released, ~355 = bottomed out). Global key id =
+`bank * 32 + slot`.
+
+Streaming mode suspends normal HID keystroke reporting — the keyboard becomes a
+pure analog-streaming device until `1e 00` is sent. (This is why DOM `keydown`
+for Space can't drive the sustain pedal; the assignment uses an analog-stream
+key id instead.)
 
 ## License
 
